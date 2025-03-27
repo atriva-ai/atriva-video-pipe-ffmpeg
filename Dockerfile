@@ -20,6 +20,12 @@ WORKDIR /app
 # Copy application files (excluding empty directories)
 COPY . /app
 
+# Ensure following directories exist (for volume mounting)
+VOLUME ["/app/videos"] # downloaded videos
+VOLUME ["/app/frames"] # decoded frames in JPEG
+VOLUME ["/app/recording"]
+VOLUME ["/app/snapshots"]
+
 # Create a virtual environment
 RUN python3 -m venv /app/venv
 
