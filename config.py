@@ -6,7 +6,7 @@ FFMPEG_PATH = "ffmpeg"
 FFPROBE_PATH = "ffprobe"
 
 # Hardware acceleration priority ( CUDA / QSV / VAAPI)
-HW_ACCEL_OPTIONS = ["cuda", "qsv", "vaapi"]  # Priority order
+HW_ACCEL_OPTIONS = ["cuda", "qsv", "vaapi", "none"]  # Priority order
 
 # Set up paths
 UPLOAD_FOLDER = Path("/app/videos")

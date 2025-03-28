@@ -63,7 +63,7 @@ def get_best_hwaccel(force_format=None):
             continue
     return None  # No available acceleration
 
-def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format: str = None, fps: int = 1):
+def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format: str = "none", fps: int = 1):
     """Decode video and extract frames as JPEG at specified FPS."""
     hw_accel = get_best_hwaccel(force_format)
     if not hw_accel:
@@ -78,16 +78,26 @@ def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format:
     # Ensure the output folder exists for this specific video
     video_name = Path(input_path).stem  # Extract filename without extension
     video_output_folder = OUTPUT_FOLDER / video_name
+    print(f"Creating output frames folder: {video_output_folder}")
     video_output_folder.mkdir(parents=True, exist_ok=True)
 
     # Naming format: <video_file_name>_<time_in_seconds_from_0>_<Nth-frame-in-a-second>.jpg
     output_template = str(video_output_folder / f"{video_name}_%04d.jpg")
+    print(f"Output template: {output_template}")
 
-    command = [
-        FFMPEG_PATH, "-hwaccel", hw_accel, "-i", input_path,
-        "-vf", f"fps={fps},format=rgb24",
-        output_template
-    ]
+    if hw_accel is "none":
+        command = [
+            FFMPEG_PATH, "-i", input_path,
+            "-vf", f"fps={fps},format=rgb24",
+            output_template
+        ]
+    else:
+        command = [
+            FFMPEG_PATH, "-hwaccel", hw_accel, "-i", input_path,
+            "-vf", f"fps={fps},format=rgb24",
+            output_template
+        ]
+    print(f"Running command: {command}")
 
     result = subprocess.run(command, capture_output=True, text=True)
 
