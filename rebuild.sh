@@ -12,6 +12,11 @@ echo "🚀 Rebuilding the Docker image..."
 docker build -t $IMAGE_NAME .
 
 echo "🎯 Running the new container..."
-docker run -d -p 8000:8000 -p 5678:5678 --name $CONTAINER_NAME $IMAGE_NAME
+# Intel VAAPI
+docker run -d -p 8000:8000 -p 5678:5678 -v $(pwd)/frames:/app/frames -v $(pwd)/videos:/app/videos -e LIBVA_DRIVER_NAME=iHD --device /dev/dri:/dev/dri --name $CONTAINER_NAME $IMAGE_NAME
+# AMD VAAPI
+# docker run -d -p 8000:8000 -p 5678:5678 -v $(pwd)/frames:/app/frames -v $(pwd)/videos:/app/videos -e LIBVA_DRIVER_NAME=radeonsi --device /dev/dri:/dev/dri --name $CONTAINER_NAME $IMAGE_NAME
+# NVIDIA VAAPI
+# docker run -d -p 8000:8000 -p 5678:5678 -v $(pwd)/frames:/app/frames -v $(pwd)/videos:/app/videos -e LIBVA_DRIVER_NAME=nvidia --device /dev/dri:/dev/dri --name $CONTAINER_NAME $IMAGE_NAME
 
 echo "✅ Done!"

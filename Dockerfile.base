@@ -9,6 +9,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt update && apt install -y \
     python3.12 python3.12-venv python3.12-dev \
     curl ffmpeg \
+    vainfo intel-media-va-driver-non-free \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
 # Set Python3.12 as default

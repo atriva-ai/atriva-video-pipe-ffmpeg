@@ -53,11 +53,15 @@ def get_best_hwaccel(force_format=None):
         return force_format  # Use the forced format if specified and valid
     for accel in HW_ACCEL_OPTIONS:
         try:
-            result = subprocess.run(
-                [FFMPEG_PATH, "-hwaccel", accel, "-version"],
-                capture_output=True, text=True
-            )
+            # Test if the hardware acceleration works by running a simple ffmpeg probe
+            test_command = [
+                FFMPEG_PATH, "-hwaccel", accel, "-f", "lavfi", "-i", "nullsrc", "-frames:v", "1", "-f", "null", "-"
+            ]
+            result = subprocess.run(test_command, capture_output=True, text=True)
+
+            # A working hwaccel should return success (exit code 0)
             if result.returncode == 0:
+                print(f"✅ {accel} is supported!")
                 return accel
         except FileNotFoundError:
             continue

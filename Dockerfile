@@ -22,10 +22,10 @@ WORKDIR /app
 COPY . /app
 
 # Ensure following directories exist (for volume mounting)
-VOLUME ["/app/videos"] # downloaded videos
-VOLUME ["/app/frames"] # decoded frames in JPEG
-VOLUME ["/app/recording"]
-VOLUME ["/app/snapshots"]
+# RUN mkdir -p /app/recording && chmod -R 777 /app/recording
+# VOLUME ["/app/recording"]
+# RUN mkdir -p /app/snapshots && chmod -R 777 /app/snapshots
+# VOLUME ["/app/snapshots"]
 
 # Create a virtual environment
 RUN python3 -m venv /app/venv
