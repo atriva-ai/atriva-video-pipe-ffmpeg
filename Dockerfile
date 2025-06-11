@@ -39,10 +39,10 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 # Expose FastAPI port
-EXPOSE 8000
+EXPOSE 8002
 
 # Create a base image label
 LABEL description="Production image with Python 3.12, FastAPI, and FFmpeg"
 
 # Command to run the FastAPI app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
