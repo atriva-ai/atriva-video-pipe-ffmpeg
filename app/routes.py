@@ -6,7 +6,11 @@ from app.models.schemas import SnapshotRequest, RecordRequest
 from config import UPLOAD_FOLDER, OUTPUT_FOLDER
 import requests
 
-router = APIRouter()
+# Create router with prefix and tags for better organization
+router = APIRouter(
+    prefix="/api/v1/video-pipeline",
+    tags=["Video Pipeline"]
+)
 
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)  # Ensure the folder exists
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -27,6 +31,7 @@ def download_video(url: str, save_path: Path):
 
 @router.post("/video-info/")
 async def video_info(video: UploadFile = File(...)):
+    """Get video metadata and information"""
     file_path = UPLOAD_FOLDER / video.filename
     print('Getting video file: {file_path}')
     # Save the uploaded file
@@ -41,6 +46,7 @@ async def video_info(video: UploadFile = File(...)):
 
 @router.get("/hw-accel-cap/")
 async def hw_accel_cap():
+    """Check available hardware acceleration options"""
     result = get_all_hwaccel()
     return {"message": result}
 
@@ -76,9 +82,9 @@ async def decode_video(
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/snapshot/")
 async def snapshot(request: SnapshotRequest):
+    """Capture a snapshot from video at specified timestamp"""
     result = capture_snapshot(request.video_url, request.timestamp, request.output_image)
     if result.returncode == 0:
         return {"message": "Snapshot captured", "output": request.output_image}
@@ -86,7 +92,31 @@ async def snapshot(request: SnapshotRequest):
 
 @router.post("/record/")
 async def record(request: RecordRequest):
+    """Record a video clip from specified start time and duration"""
     result = record_clip(request.video_url, request.start_time, request.duration, request.output_path)
     if result.returncode == 0:
         return {"message": "Recording successful", "output": request.output_path}
     raise HTTPException(status_code=500, detail=result.stderr)
+
+# Health check endpoint
+@router.get("/health/")
+async def health_check():
+    """Health check for video pipeline service"""
+    return {"status": "healthy", "service": "video-pipeline"}
+
+# Debug endpoint
+@router.get("/debug/")
+async def debug_info():
+    """Debug information for video pipeline service"""
+    import socket
+    import os
+    return {
+        "status": "running",
+        "service": "video-pipeline",
+        "hostname": socket.gethostname(),
+        "port": 8002,
+        "environment": {
+            "FFMPEG_PATH": os.getenv("FFMPEG_PATH", "ffmpeg"),
+            "FFPROBE_PATH": os.getenv("FFPROBE_PATH", "ffprobe")
+        }
+    }
