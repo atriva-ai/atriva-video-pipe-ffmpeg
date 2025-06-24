@@ -44,6 +44,15 @@ async def video_info(video: UploadFile = File(...)):
         return {"message": "Video information retrieved", "info": info}
     raise HTTPException(status_code=500, detail="Could not retrieve video information")
 
+@router.post("/video-info-url/")
+async def video_info_url(url: str = Form(...)):
+    """Get video metadata and information from URL"""
+    print(f"Getting video info from URL: {url}")
+    info = get_video_info(url)
+    if info.get("codec") and "error" not in info:
+        return {"message": "Video information retrieved", "info": info}
+    raise HTTPException(status_code=500, detail=f"Could not retrieve video information: {info.get('error', 'Unknown error')}")
+
 @router.get("/hw-accel-cap/")
 async def hw_accel_cap():
     """Check available hardware acceleration options"""
@@ -64,16 +73,17 @@ async def decode_video(
     # Handle file upload
     if file:
         input_path = UPLOAD_FOLDER / file.filename
-        print("Decoding video file: {input_path}")
+        print(f"Decoding video file: {input_path}")
         with input_path.open("wb") as buffer:
             buffer.write(await file.read())
 
     # Handle URL input
     elif url:
-        filename = url.split("/")[-1]  # Extract filename from URL
-        print("Decoding video URL: {filename}")
-        input_path = UPLOAD_FOLDER / filename
-        input_path = download_video(url, input_path)  # Download the video
+        # filename = url.split("/")[-1]  # Extract filename from URL
+        print(f"Decoding video URL: {url}")
+        input_path = url
+        # input_path = UPLOAD_FOLDER / filename
+        # input_path = download_video(url, input_path)  # Download the video
 
     # Process the video
     try:
