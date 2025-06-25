@@ -105,7 +105,12 @@ def get_best_hwaccel(force_format=None):
     """Check available hardware acceleration and return the best option."""
     if force_format and force_format in HW_ACCEL_OPTIONS:
         return force_format  # Use the forced format if specified and valid
+    
+    # Always include "none" as a fallback option
     for accel in HW_ACCEL_OPTIONS:
+        if accel == "none":
+            print(f"✅ Using software decoding (none)")
+            return "none"
         try:
             # Test if the hardware acceleration works by running a simple ffmpeg probe
             test_command = [
@@ -119,13 +124,14 @@ def get_best_hwaccel(force_format=None):
                 return accel
         except FileNotFoundError:
             continue
-    return None  # No available acceleration
+    
+    # If no hardware acceleration works, fall back to software decoding
+    print(f"⚠️ No hardware acceleration available, using software decoding")
+    return "none"
 
-def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format: str = "none", fps: int = 1):
+def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format: str = "none", fps: int = 1, camera_id: str = None):
     """Decode video and extract frames as JPEG at specified FPS."""
     hw_accel = get_best_hwaccel(force_format)
-    if not hw_accel:
-        raise RuntimeError("No supported hardware acceleration found.")
     print(f"Transcoding videos to JPEGs using HW mode: {hw_accel}")
     
     # get video info
@@ -133,9 +139,15 @@ def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format:
     v_info = get_video_info(input_path)
     print(f"Video format: {v_info["format"]}, codec: {v_info["codec"]}, width: {v_info["width"]}, height: {v_info["height"]}, fps: {v_info["fps"]}")
 
-    # Ensure the output folder exists for this specific video
-    video_name = Path(input_path).stem  # Extract filename without extension
-    video_output_folder = OUTPUT_FOLDER / video_name
+    # Use camera_id for output folder if provided, otherwise use video name
+    if camera_id:
+        video_output_folder = OUTPUT_FOLDER / camera_id
+        video_name = camera_id
+    else:
+        # Fallback to original behavior for backward compatibility
+        video_name = Path(input_path).stem  # Extract filename without extension
+        video_output_folder = OUTPUT_FOLDER / video_name
+    
     print(f"Creating output frames folder: {video_output_folder}")
     video_output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -144,7 +156,7 @@ def decode_video2frames_in_jpeg(input_path: str, output_path: str, force_format:
     print(f"Output template: {output_template}")
 
     # Build command with RTSP transport support
-    if hw_accel is "none":
+    if hw_accel == "none":
         if input_path.startswith('rtsp://'):
             command = [
                 FFMPEG_PATH, "-rtsp_transport", "tcp", "-i", input_path,

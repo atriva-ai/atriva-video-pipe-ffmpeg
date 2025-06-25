@@ -1,10 +1,13 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 from app.services.ffmpeg_utils import decode_video2frames_in_jpeg, capture_snapshot, record_clip, get_video_info, get_all_hwaccel
 from app.models.schemas import SnapshotRequest, RecordRequest
 from config import UPLOAD_FOLDER, OUTPUT_FOLDER
 import requests
+import subprocess
+import os
+import threading
 
 # Create router with prefix and tags for better organization
 router = APIRouter(
@@ -14,6 +17,11 @@ router = APIRouter(
 
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)  # Ensure the folder exists
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+# Global decode task manager
+# Structure: { camera_id: { 'process': Popen, 'output_folder': str, 'status': str, 'last_error': str|None } }
+decode_tasks: Dict[str, dict] = {}
+task_lock = threading.Lock()
 
 def download_video(url: str, save_path: Path):
     """Download a video file from a given URL and save it locally."""
@@ -59,38 +67,155 @@ async def hw_accel_cap():
     result = get_all_hwaccel()
     return {"message": result}
 
+def get_frame_count(output_folder):
+    try:
+        return len([f for f in os.listdir(output_folder) if f.endswith('.jpg')])
+    except Exception:
+        return 0
+
+def is_process_running(proc):
+    return proc and proc.poll() is None
+
 @router.post("/decode/")
 async def decode_video(
+    camera_id: str = Form(...),
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
-    fps: Optional[int] = Form(1),  # Default FPS is 1 frame per second
+    fps: Optional[int] = Form(1),
     force_format: Optional[str] = Form(None)
 ):
-    """Process a video file from either an uploaded file or a URL and extract frames at specified FPS."""
+    """Start decoding for a camera and register the process."""
     if not file and not url:
         raise HTTPException(status_code=400, detail="Either a file or a URL must be provided.")
 
-    # Handle file upload
+    # Prepare input
     if file:
         input_path = UPLOAD_FOLDER / file.filename
         print(f"Decoding video file: {input_path}")
         with input_path.open("wb") as buffer:
             buffer.write(await file.read())
-
-    # Handle URL input
     elif url:
-        # filename = url.split("/")[-1]  # Extract filename from URL
         print(f"Decoding video URL: {url}")
         input_path = url
-        # input_path = UPLOAD_FOLDER / filename
-        # input_path = download_video(url, input_path)  # Download the video
 
-    # Process the video
+    # Prepare output folder for this camera
+    output_folder = OUTPUT_FOLDER / camera_id
+    output_folder.mkdir(parents=True, exist_ok=True)
+
     try:
-        output_folder = decode_video2frames_in_jpeg(str(input_path), str(OUTPUT_FOLDER), force_format, fps)
-        return {"message": "Video processed successfully", "output_folder": output_folder}
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Run ffmpeg decode asynchronously in a subprocess
+        print(f"Starting decode for camera {camera_id} with input: {input_path}")
+        
+        # Build ffmpeg command
+        if input_path.startswith('rtsp://'):
+            ffmpeg_cmd = [
+                "ffmpeg", "-rtsp_transport", "tcp", "-i", str(input_path),
+                "-vf", f"fps={fps},format=rgb24",
+                f"{output_folder}/frame_%04d.jpg"
+            ]
+        else:
+            ffmpeg_cmd = [
+                "ffmpeg", "-i", str(input_path),
+                "-vf", f"fps={fps},format=rgb24",
+                f"{output_folder}/frame_%04d.jpg"
+            ]
+        
+        print(f"Running ffmpeg command: {ffmpeg_cmd}")
+        proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Register the task as running
+        with task_lock:
+            decode_tasks[camera_id] = {
+                'process': proc,
+                'output_folder': str(output_folder),
+                'status': 'running',
+                'last_error': None
+            }
+        
+        print(f"Decode started for camera {camera_id}, process PID: {proc.pid}")
+        return {
+            "message": "Decoding started", 
+            "camera_id": camera_id, 
+            "output_folder": str(output_folder)
+        }
+        
+    except Exception as e:
+        error_msg = f"Failed to start decode: {str(e)}"
+        print(f"Error in decode for camera {camera_id}: {error_msg}")
+        with task_lock:
+            decode_tasks[camera_id] = {
+                'process': None,
+                'output_folder': str(output_folder),
+                'status': 'error',
+                'last_error': error_msg
+            }
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@router.post("/decode/stop/")
+async def stop_decode(camera_id: str = Form(...)):
+    """Stop decoding for a camera."""
+    with task_lock:
+        task = decode_tasks.get(camera_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="No decode task found for this camera.")
+        
+        proc = task['process']
+        if proc is None:
+            # Synchronous decode completed - just mark as stopped
+            task['status'] = 'stopped'
+            print(f"Marked synchronous decode task as stopped for camera {camera_id}")
+            return {"message": "Decoding stopped", "camera_id": camera_id}
+        
+        # Handle subprocess-based decoding
+        if is_process_running(proc):
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        task['status'] = 'stopped'
+        return {"message": "Decoding stopped", "camera_id": camera_id}
+
+@router.get("/decode/status/")
+async def decode_status(camera_id: str):
+    """Get the status of the decode task for a camera."""
+    with task_lock:
+        task = decode_tasks.get(camera_id)
+        if not task:
+            return {"camera_id": camera_id, "status": "not_started", "frame_count": 0}
+        
+        proc = task['process']
+        if proc is None:
+            # No process (error or not started)
+            frame_count = get_frame_count(task['output_folder'])
+            return {
+                "camera_id": camera_id,
+                "status": task['status'],
+                "frame_count": frame_count,
+                "last_error": task.get('last_error')
+            }
+        
+        # Check if subprocess is still running
+        running = is_process_running(proc)
+        frame_count = get_frame_count(task['output_folder'])
+        
+        # Update status if process completed
+        if not running and task['status'] == 'running':
+            return_code = proc.poll()
+            if return_code == 0:
+                task['status'] = 'completed'
+                print(f"Decode process completed successfully for camera {camera_id}")
+            else:
+                task['status'] = 'error'
+                task['last_error'] = f"Process exited with code {return_code}"
+                print(f"Decode process failed for camera {camera_id} with code {return_code}")
+        
+        return {
+            "camera_id": camera_id,
+            "status": task['status'],
+            "frame_count": frame_count,
+            "last_error": task.get('last_error')
+        }
 
 @router.post("/snapshot/")
 async def snapshot(request: SnapshotRequest):
