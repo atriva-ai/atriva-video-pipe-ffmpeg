@@ -8,6 +8,7 @@ import requests
 import subprocess
 import os
 import threading
+from fastapi.responses import FileResponse
 
 # Create router with prefix and tags for better organization
 router = APIRouter(
@@ -88,6 +89,24 @@ async def decode_video(
     if not file and not url:
         raise HTTPException(status_code=400, detail="Either a file or a URL must be provided.")
 
+    # Check if a decode task already exists for this camera
+    with task_lock:
+        existing_task = decode_tasks.get(camera_id)
+        if existing_task and existing_task['process'] and is_process_running(existing_task['process']):
+            return {
+                "message": "Decoding already running", 
+                "camera_id": camera_id, 
+                "output_folder": existing_task['output_folder'],
+                "status": "already_running"
+            }
+        elif existing_task and existing_task['status'] == 'running':
+            return {
+                "message": "Decoding already running", 
+                "camera_id": camera_id, 
+                "output_folder": existing_task['output_folder'],
+                "status": "already_running"
+            }
+
     # Prepare input
     if file:
         input_path = UPLOAD_FOLDER / file.filename
@@ -107,15 +126,16 @@ async def decode_video(
         print(f"Starting decode for camera {camera_id} with input: {input_path}")
         
         # Build ffmpeg command
-        if input_path.startswith('rtsp://'):
+        input_path_str = str(input_path)
+        if input_path_str.startswith('rtsp://'):
             ffmpeg_cmd = [
-                "ffmpeg", "-rtsp_transport", "tcp", "-i", str(input_path),
+                "ffmpeg", "-rtsp_transport", "tcp", "-i", input_path_str,
                 "-vf", f"fps={fps},format=rgb24",
                 f"{output_folder}/frame_%04d.jpg"
             ]
         else:
             ffmpeg_cmd = [
-                "ffmpeg", "-i", str(input_path),
+                "ffmpeg", "-i", input_path_str,
                 "-vf", f"fps={fps},format=rgb24",
                 f"{output_folder}/frame_%04d.jpg"
             ]
@@ -136,7 +156,8 @@ async def decode_video(
         return {
             "message": "Decoding started", 
             "camera_id": camera_id, 
-            "output_folder": str(output_folder)
+            "output_folder": str(output_folder),
+            "status": "started"
         }
         
     except Exception as e:
@@ -255,3 +276,25 @@ async def debug_info():
             "FFPROBE_PATH": os.getenv("FFPROBE_PATH", "ffprobe")
         }
     }
+
+@router.get("/latest-frame/")
+async def get_latest_frame(camera_id: str):
+    """Get the latest decoded frame for a camera"""
+    with task_lock:
+        task = decode_tasks.get(camera_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="No decode task found for this camera.")
+        
+        output_folder = Path(task['output_folder'])
+        if not output_folder.exists():
+            raise HTTPException(status_code=500, detail="Output folder does not exist for this camera.")
+        
+        frame_count = get_frame_count(output_folder)
+        if frame_count == 0:
+            raise HTTPException(status_code=500, detail="No frames found in the output folder for this camera.")
+        
+        latest_frame_path = output_folder / f"frame_{frame_count - 1:04d}.jpg"
+        if not latest_frame_path.exists():
+            raise HTTPException(status_code=500, detail="Latest frame does not exist in the output folder for this camera.")
+        
+        return FileResponse(latest_frame_path)
