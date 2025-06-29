@@ -8,6 +8,8 @@ import requests
 import subprocess
 import os
 import threading
+import shutil
+import time
 from fastapi.responses import FileResponse
 
 # Create router with prefix and tags for better organization
@@ -23,6 +25,33 @@ OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 # Structure: { camera_id: { 'process': Popen, 'output_folder': str, 'status': str, 'last_error': str|None } }
 decode_tasks: Dict[str, dict] = {}
 task_lock = threading.Lock()
+
+def cleanup_camera_frames(camera_id: str):
+    """Clean up all frames for a specific camera"""
+    try:
+        camera_folder = OUTPUT_FOLDER / camera_id
+        if camera_folder.exists():
+            # Remove all .jpg files in the camera folder
+            for file in camera_folder.glob("*.jpg"):
+                file.unlink()
+            print(f"Cleaned up frames for camera {camera_id}")
+    except Exception as e:
+        print(f"Error cleaning up frames for camera {camera_id}: {e}")
+
+def cleanup_orphaned_frames():
+    """Clean up frames for cameras that no longer exist in decode_tasks"""
+    try:
+        # Get all camera folders
+        for camera_folder in OUTPUT_FOLDER.iterdir():
+            if camera_folder.is_dir():
+                camera_id = camera_folder.name
+                # Check if this camera is still in active decode tasks
+                with task_lock:
+                    if camera_id not in decode_tasks or decode_tasks[camera_id]['status'] == 'stopped':
+                        # Camera is not active, clean up its frames
+                        cleanup_camera_frames(camera_id)
+    except Exception as e:
+        print(f"Error cleaning up orphaned frames: {e}")
 
 def download_video(url: str, save_path: Path):
     """Download a video file from a given URL and save it locally."""
@@ -121,6 +150,9 @@ async def decode_video(
     output_folder = OUTPUT_FOLDER / camera_id
     output_folder.mkdir(parents=True, exist_ok=True)
 
+    # Clean up any existing frames for this camera before starting new decode
+    cleanup_camera_frames(camera_id)
+
     try:
         # Run ffmpeg decode asynchronously in a subprocess
         print(f"Starting decode for camera {camera_id} with input: {input_path}")
@@ -185,6 +217,8 @@ async def stop_decode(camera_id: str = Form(...)):
             # Synchronous decode completed - just mark as stopped
             task['status'] = 'stopped'
             print(f"Marked synchronous decode task as stopped for camera {camera_id}")
+            # Clean up frames when stopping
+            cleanup_camera_frames(camera_id)
             return {"message": "Decoding stopped", "camera_id": camera_id}
         
         # Handle subprocess-based decoding
@@ -195,6 +229,9 @@ async def stop_decode(camera_id: str = Form(...)):
             except subprocess.TimeoutExpired:
                 proc.kill()
         task['status'] = 'stopped'
+        
+        # Clean up frames when stopping
+        cleanup_camera_frames(camera_id)
         return {"message": "Decoding stopped", "camera_id": camera_id}
 
 @router.get("/decode/status/")
@@ -277,6 +314,16 @@ async def debug_info():
         }
     }
 
+@router.post("/cleanup/")
+async def cleanup_frames(camera_id: Optional[str] = Form(None)):
+    """Clean up frames for a specific camera or all orphaned frames"""
+    if camera_id:
+        cleanup_camera_frames(camera_id)
+        return {"message": f"Cleaned up frames for camera {camera_id}"}
+    else:
+        cleanup_orphaned_frames()
+        return {"message": "Cleaned up all orphaned frames"}
+
 @router.get("/latest-frame/")
 async def get_latest_frame(camera_id: str):
     """Get the latest decoded frame for a camera"""
@@ -296,5 +343,13 @@ async def get_latest_frame(camera_id: str):
         latest_frame_path = output_folder / f"frame_{frame_count - 1:04d}.jpg"
         if not latest_frame_path.exists():
             raise HTTPException(status_code=500, detail="Latest frame does not exist in the output folder for this camera.")
+        
+        # Check if the latest frame is too old (more than 5 minutes)
+        current_time = time.time()
+        frame_mtime = latest_frame_path.stat().st_mtime
+        if current_time - frame_mtime > 300:  # 5 minutes = 300 seconds
+            print(f"Warning: Latest frame for camera {camera_id} is too old ({current_time - frame_mtime:.1f}s), cleaning up")
+            cleanup_camera_frames(camera_id)
+            raise HTTPException(status_code=500, detail="Latest frame is too old, frames have been cleaned up")
         
         return FileResponse(latest_frame_path)
