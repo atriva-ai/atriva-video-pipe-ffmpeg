@@ -106,6 +106,100 @@ def get_frame_count(output_folder):
 def is_process_running(proc):
     return proc and proc.poll() is None
 
+def restart_decode_process(camera_id: str, task: dict) -> bool:
+    """
+    Attempt to restart a stopped decode process.
+    Returns True if restart was successful, False otherwise.
+    """
+    proc = task.get('process')
+    if not proc:
+        return False
+    
+    return_code = proc.poll()
+    input_url = task.get('input_url', '')
+    
+    # For RTSP streams, auto-restart if process stopped
+    if input_url and input_url.startswith('rtsp://'):
+        restart_count = task.get('restart_count', 0)
+        max_restarts = 10  # Max auto-restarts before giving up
+        
+        if restart_count >= max_restarts:
+            task['status'] = 'error'
+            task['last_error'] = f"Max restarts ({max_restarts}) reached"
+            print(f"Decoder for camera {camera_id} exceeded max restarts")
+            return False
+        
+        print(f"RTSP decoder for camera {camera_id} stopped (code {return_code}), auto-restarting... (attempt {restart_count + 1})")
+        
+        # Restart the decoder
+        output_folder = Path(task['output_folder'])
+        fps = task.get('fps', 1)
+        
+        ffmpeg_cmd = [
+            "ffmpeg", 
+            "-rtsp_transport", "tcp",
+            "-timeout", "5000000",
+            "-i", input_url,
+            "-vf", f"fps={fps},format=rgb24",
+            "-q:v", "2",
+            f"{output_folder}/frame_%04d.jpg"
+        ]
+        
+        try:
+            new_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            task['process'] = new_proc
+            task['status'] = 'running'
+            task['restart_count'] = restart_count + 1
+            task['last_error'] = None
+            print(f"Decoder restarted for camera {camera_id}, new PID: {new_proc.pid}")
+            return True
+        except Exception as e:
+            task['status'] = 'error'
+            task['last_error'] = f"Auto-restart failed: {str(e)}"
+            print(f"Failed to restart decoder for camera {camera_id}: {e}")
+            return False
+    else:
+        # Non-RTSP stream - mark as completed/error normally
+        if return_code == 0:
+            task['status'] = 'completed'
+            print(f"Decode process completed successfully for camera {camera_id}")
+        else:
+            task['status'] = 'error'
+            task['last_error'] = f"Process exited with code {return_code}"
+            print(f"Decode process failed for camera {camera_id} with code {return_code}")
+        return False
+
+def check_and_restart_decode_processes():
+    """
+    Check all active decode processes and restart any that have stopped.
+    This function should be called periodically in the background.
+    """
+    cameras_to_check = []
+    with task_lock:
+        # Get a copy of camera IDs to check
+        cameras_to_check = list(decode_tasks.keys())
+    
+    for camera_id in cameras_to_check:
+        with task_lock:
+            task = decode_tasks.get(camera_id)
+            if not task:
+                continue
+            
+            # Only check processes that are marked as running
+            if task['status'] != 'running':
+                continue
+            
+            proc = task.get('process')
+            if not proc:
+                continue
+            
+            # Check if process is still running
+            running = is_process_running(proc)
+            
+            if not running:
+                # Process stopped - attempt restart
+                restart_decode_process(camera_id, task)
+
 @router.post("/decode/")
 async def decode_video(
     camera_id: str = Form(...),
@@ -162,14 +256,13 @@ async def decode_video(
         if input_path_str.startswith('rtsp://'):
             # RTSP-specific options for better stability:
             # -rtsp_transport tcp: Use TCP for more reliable connection
-            # -stimeout 5000000: Socket timeout 5 seconds (in microseconds)
-            # -timeout 5000000: Connection timeout 5 seconds
+            # -timeout 5000000: Connection timeout 5 seconds (in microseconds)
             # -reconnect_on_network_error 1: Try to reconnect on network errors
             # -fflags +genpts: Generate missing PTS for smoother playback
             ffmpeg_cmd = [
                 "ffmpeg", 
                 "-rtsp_transport", "tcp",
-                "-stimeout", "5000000",
+                "-timeout", "5000000",
                 "-i", input_path_str,
                 "-vf", f"fps={fps},format=rgb24",
                 "-q:v", "2",  # High quality JPEG
@@ -230,7 +323,10 @@ async def stop_decode(camera_id: str = Form(...)):
     with task_lock:
         task = decode_tasks.get(camera_id)
         if not task:
-            raise HTTPException(status_code=404, detail="No decode task found for this camera.")
+            # No task exists - already stopped, just clean up frames and return success
+            print(f"No decode task found for camera {camera_id}, already stopped")
+            cleanup_camera_frames(camera_id)
+            return {"message": "Decoding stopped (no task was running)", "camera_id": camera_id}
         
         proc = task['process']
         if proc is None:
@@ -277,57 +373,32 @@ async def decode_status(camera_id: str):
         running = is_process_running(proc)
         frame_count = get_frame_count(task['output_folder'])
         
+        # Check for stale frames if status is running
+        if task['status'] == 'running' and frame_count > 0:
+            output_folder = Path(task['output_folder'])
+            try:
+                jpg_files = list(output_folder.glob("*.jpg"))
+                if jpg_files:
+                    latest_frame_path = max(jpg_files, key=lambda f: f.stat().st_mtime)
+                    current_time = time.time()
+                    frame_mtime = latest_frame_path.stat().st_mtime
+                    frame_age = current_time - frame_mtime
+                    
+                    # If frames are very old (>5 minutes), mark as error
+                    if frame_age > 300:
+                        task['status'] = 'error'
+                        task['last_error'] = f"Stream disconnected - no new frames for {frame_age:.1f}s"
+                        print(f"Camera {camera_id} marked as error: frames are {frame_age:.1f}s old")
+                        # Clean up stale frames
+                        cleanup_camera_frames(camera_id)
+                        frame_count = 0
+            except Exception as e:
+                print(f"Error checking frame age for camera {camera_id}: {e}")
+        
         # Update status if process completed/stopped
         if not running and task['status'] == 'running':
-            return_code = proc.poll()
-            input_url = task.get('input_url', '')
-            
-            # For RTSP streams, auto-restart if process stopped (even with code 0)
-            if input_url and input_url.startswith('rtsp://'):
-                restart_count = task.get('restart_count', 0)
-                max_restarts = 10  # Max auto-restarts before giving up
-                
-                if restart_count < max_restarts:
-                    print(f"RTSP decoder for camera {camera_id} stopped (code {return_code}), auto-restarting... (attempt {restart_count + 1})")
-                    
-                    # Restart the decoder
-                    output_folder = Path(task['output_folder'])
-                    fps = task.get('fps', 1)
-                    
-                    ffmpeg_cmd = [
-                        "ffmpeg", 
-                        "-rtsp_transport", "tcp",
-                        "-stimeout", "5000000",
-                        "-i", input_url,
-                        "-vf", f"fps={fps},format=rgb24",
-                        "-q:v", "2",
-                        f"{output_folder}/frame_%04d.jpg"
-                    ]
-                    
-                    try:
-                        new_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        task['process'] = new_proc
-                        task['status'] = 'running'
-                        task['restart_count'] = restart_count + 1
-                        task['last_error'] = None
-                        print(f"Decoder restarted for camera {camera_id}, new PID: {new_proc.pid}")
-                    except Exception as e:
-                        task['status'] = 'error'
-                        task['last_error'] = f"Auto-restart failed: {str(e)}"
-                        print(f"Failed to restart decoder for camera {camera_id}: {e}")
-                else:
-                    task['status'] = 'error'
-                    task['last_error'] = f"Max restarts ({max_restarts}) reached"
-                    print(f"Decoder for camera {camera_id} exceeded max restarts")
-            else:
-                # Non-RTSP stream - mark as completed/error normally
-                if return_code == 0:
-                    task['status'] = 'completed'
-                    print(f"Decode process completed successfully for camera {camera_id}")
-                else:
-                    task['status'] = 'error'
-                    task['last_error'] = f"Process exited with code {return_code}"
-                    print(f"Decode process failed for camera {camera_id} with code {return_code}")
+            # Use the shared restart function
+            restart_decode_process(camera_id, task)
         
         return {
             "camera_id": camera_id,
@@ -419,12 +490,21 @@ async def get_latest_frame(camera_id: str):
             proc = task.get('process')
             if proc and not is_process_running(proc):
                 print(f"Decoder process for camera {camera_id} has stopped")
-                task['status'] = 'stopped'
+                # Attempt to restart if it's an RTSP stream
+                if task.get('status') == 'running':
+                    restart_decode_process(camera_id, task)
+                else:
+                    task['status'] = 'stopped'
             
-            # If frame is very old (>5 minutes), clean up
+            # If frame is very old (>5 minutes), clean up and mark as stopped
             if frame_age > 300:
                 print(f"Cleaning up stale frames for camera {camera_id}")
                 cleanup_camera_frames(camera_id)
+                # Update task status to reflect that streaming has stopped
+                if task.get('status') == 'running':
+                    task['status'] = 'error'
+                    task['last_error'] = f"Stream disconnected - no frames for {frame_age:.1f}s"
+                    print(f"Marked camera {camera_id} as error due to stale frames")
                 raise HTTPException(status_code=404, detail="Stream appears to be disconnected. Please restart the camera.")
         
         return FileResponse(latest_frame_path)
