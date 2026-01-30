@@ -139,6 +139,10 @@ def restart_decode_process(camera_id: str, task: dict) -> bool:
             "ffmpeg", 
             "-rtsp_transport", "tcp",
             "-timeout", "5000000",
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "2",
             "-i", input_url,
             "-vf", f"fps={fps},format=rgb24",
             "-q:v", "2",
@@ -159,15 +163,62 @@ def restart_decode_process(camera_id: str, task: dict) -> bool:
             print(f"Failed to restart decoder for camera {camera_id}: {e}")
             return False
     else:
-        # Non-RTSP stream - mark as completed/error normally
-        if return_code == 0:
-            task['status'] = 'completed'
-            print(f"Decode process completed successfully for camera {camera_id}")
+        # Non-RTSP stream - check if it's a mediaMTX stream that should be restarted
+        # mediaMTX streams through RTSP should always restart, even if they exit with code 0
+        # (which happens when a file loops)
+        if 'localhost:8554' in input_url or 'mediamtx' in input_url.lower() or '8554' in input_url:
+            # This is likely a mediaMTX stream - restart it even if it exited successfully
+            print(f"mediaMTX stream for camera {camera_id} stopped (code {return_code}), restarting...")
+            restart_count = task.get('restart_count', 0)
+            max_restarts = 100  # Allow many restarts for looping streams
+            
+            if restart_count >= max_restarts:
+                task['status'] = 'error'
+                task['last_error'] = f"Max restarts ({max_restarts}) reached"
+                print(f"Decoder for camera {camera_id} exceeded max restarts")
+                return False
+            
+            # Restart with same settings
+            output_folder = Path(task['output_folder'])
+            fps = task.get('fps', 1)
+            
+            ffmpeg_cmd = [
+                "ffmpeg", 
+                "-rtsp_transport", "tcp",
+                "-timeout", "5000000",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
+                "-i", input_url,
+                "-vf", f"fps={fps},format=rgb24",
+                "-q:v", "2",
+                f"{output_folder}/frame_%04d.jpg"
+            ]
+            
+            try:
+                new_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                task['process'] = new_proc
+                task['status'] = 'running'
+                task['restart_count'] = restart_count + 1
+                task['last_error'] = None
+                print(f"mediaMTX decoder restarted for camera {camera_id}, new PID: {new_proc.pid}")
+                return True
+            except Exception as e:
+                task['status'] = 'error'
+                task['last_error'] = f"Auto-restart failed: {str(e)}"
+                print(f"Failed to restart mediaMTX decoder for camera {camera_id}: {e}")
+                return False
         else:
-            task['status'] = 'error'
-            task['last_error'] = f"Process exited with code {return_code}"
-            print(f"Decode process failed for camera {camera_id} with code {return_code}")
-        return False
+            # Non-RTSP, non-mediaMTX stream - mark as completed/error normally
+            if return_code == 0:
+                task['status'] = 'completed'
+                print(f"Decode process completed successfully for camera {camera_id}")
+            else:
+                task['status'] = 'error'
+                task['last_error'] = f"Process exited with code {return_code}"
+                print(f"Decode process failed for camera {camera_id} with code {return_code}")
+            return False
 
 def check_and_restart_decode_processes():
     """
@@ -178,6 +229,9 @@ def check_and_restart_decode_processes():
     with task_lock:
         # Get a copy of camera IDs to check
         cameras_to_check = list(decode_tasks.keys())
+    
+    if not cameras_to_check:
+        return  # No active tasks to monitor
     
     for camera_id in cameras_to_check:
         with task_lock:
@@ -197,8 +251,16 @@ def check_and_restart_decode_processes():
             running = is_process_running(proc)
             
             if not running:
+                # Process stopped - get return code and log it
+                return_code = proc.poll()
+                input_url = task.get('input_url', 'unknown')
+                print(f"🔍 Monitor detected stopped process for camera {camera_id} (return code: {return_code}, input: {input_url})")
                 # Process stopped - attempt restart
-                restart_decode_process(camera_id, task)
+                restart_success = restart_decode_process(camera_id, task)
+                if restart_success:
+                    print(f"✅ Successfully restarted decode process for camera {camera_id}")
+                else:
+                    print(f"❌ Failed to restart decode process for camera {camera_id}")
 
 @router.post("/decode/")
 async def decode_video(
@@ -259,10 +321,15 @@ async def decode_video(
             # -timeout 5000000: Connection timeout 5 seconds (in microseconds)
             # -reconnect_on_network_error 1: Try to reconnect on network errors
             # -fflags +genpts: Generate missing PTS for smoother playback
+            # -stream_loop -1: Loop the input stream indefinitely (for mediaMTX file-based streams)
             ffmpeg_cmd = [
                 "ffmpeg", 
                 "-rtsp_transport", "tcp",
                 "-timeout", "5000000",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
                 "-i", input_path_str,
                 "-vf", f"fps={fps},format=rgb24",
                 "-q:v", "2",  # High quality JPEG

@@ -1,4 +1,4 @@
-import subprocess, json
+import subprocess, json, re
 from config import FFMPEG_PATH, FFPROBE_PATH, HW_ACCEL_OPTIONS, OUTPUT_FOLDER
 from pathlib import Path
 
@@ -39,30 +39,68 @@ def get_video_info(input_url: str):
             line = line.strip()
             
             # Extract codec information
-            if "Stream #0:0: Video:" in line:
+            if "Stream #0:0: Video:" in line or "Stream #0:" in line and "Video:" in line:
                 # Example: Stream #0:0: Video: mpeg4, yuv420p(tv, progressive), 640x480 [SAR 1:1 DAR 4:3], q=2-31, 200 kb/s, 1 fps, 90k tbn
+                # Example: Stream #0:0: Video: wrapped_avframe, yuv420p, 640x480 [SAR 1:1 DAR 4:3], 25 fps, 25 tbr, 1200k tbn, 25 tbc
+                # Example: Stream #0:0: Video: h264 (H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10), yuv420p, 1920x1080
                 parts = line.split(',')
-                if len(parts) >= 3:
-                    # Extract codec
+                if len(parts) >= 1:
+                    # Extract codec - look for actual codec name, not container formats
                     codec_part = parts[0].split(':')[-1].strip()
-                    video_info["codec"] = codec_part.split()[0] if codec_part else "unknown"
+                    codec_name = codec_part.split()[0] if codec_part else "unknown"
                     
-                    # Extract resolution
-                    resolution_part = parts[2].strip()
-                    if 'x' in resolution_part:
-                        try:
-                            width, height = resolution_part.split('x')
-                            video_info["width"] = int(width)
-                            video_info["height"] = int(height.split()[0])  # Remove any trailing text
-                        except (ValueError, IndexError):
-                            pass
+                    # Filter out container/wrapper formats and get actual codec
+                    wrapper_formats = ['wrapped_avframe', 'avframe', 'rawvideo']
+                    if codec_name.lower() in wrapper_formats:
+                        # Look for codec in parentheses or next parts
+                        # Try to find codec name in the line
+                        codec_patterns = ['h264', 'h265', 'hevc', 'mpeg4', 'mpeg2', 'vp8', 'vp9', 'av1']
+                        found_codec = "unknown"
+                        for pattern in codec_patterns:
+                            if pattern in line.lower():
+                                found_codec = pattern.upper() if pattern in ['h264', 'h265', 'hevc'] else pattern
+                                break
+                        video_info["codec"] = found_codec if found_codec != "unknown" else codec_name
+                    else:
+                        video_info["codec"] = codec_name
+                    
+                    # Extract resolution - look in multiple places
+                    resolution_found = False
+                    for part in parts:
+                        part = part.strip()
+                        if 'x' in part and not resolution_found:
+                            # Try to extract resolution from this part
+                            # Format: "640x480" or "640x480 [SAR 1:1 DAR 4:3]"
+                            try:
+                                # Extract just the resolution part
+                                res_match = part.split()[0]  # Get first token
+                                if 'x' in res_match:
+                                    width, height = res_match.split('x')
+                                    video_info["width"] = int(width)
+                                    video_info["height"] = int(height)
+                                    resolution_found = True
+                            except (ValueError, IndexError):
+                                pass
+                    
+                    # If resolution not found in comma-separated parts, try parsing the whole line
+                    if not resolution_found:
+                        res_match = re.search(r'(\d+)x(\d+)', line)
+                        if res_match:
+                            video_info["width"] = int(res_match.group(1))
+                            video_info["height"] = int(res_match.group(2))
                     
                     # Extract frame rate
                     for part in parts:
                         if 'fps' in part:
                             try:
-                                fps_str = part.split()[0]  # Get the fps value
-                                video_info["fps"] = float(fps_str)
+                                # Look for pattern like "25 fps" or "25.0 fps"
+                                fps_match = re.search(r'(\d+\.?\d*)\s*fps', part)
+                                if fps_match:
+                                    video_info["fps"] = float(fps_match.group(1))
+                                else:
+                                    # Fallback: try to get first number
+                                    fps_str = part.split()[0]
+                                    video_info["fps"] = float(fps_str)
                             except (ValueError, IndexError):
                                 pass
                             break

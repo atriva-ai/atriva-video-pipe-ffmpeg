@@ -29,12 +29,14 @@ async def background_monitor_decode_processes():
     """
     while True:
         try:
-            await asyncio.sleep(30)  # Check every 30 seconds
+            await asyncio.sleep(10)  # Check every 10 seconds (more frequent for better responsiveness)
             check_and_restart_decode_processes()
         except Exception as e:
             print(f"Error in background monitor: {e}")
+            import traceback
+            traceback.print_exc()
             # Continue monitoring even if there's an error
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
 @app.on_event("startup")
 async def startup_event():
