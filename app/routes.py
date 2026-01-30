@@ -250,6 +250,44 @@ def check_and_restart_decode_processes():
             # Check if process is still running
             running = is_process_running(proc)
             
+            # Check for stale frames even if process is running (process might be frozen)
+            frame_count = get_frame_count(task['output_folder'])
+            if frame_count > 0:
+                output_folder = Path(task['output_folder'])
+                try:
+                    jpg_files = list(output_folder.glob("*.jpg"))
+                    if jpg_files:
+                        latest_frame_path = max(jpg_files, key=lambda f: f.stat().st_mtime)
+                        current_time = time.time()
+                        frame_mtime = latest_frame_path.stat().st_mtime
+                        frame_age = current_time - frame_mtime
+                        
+                        # If frames are stale (>1 minute), restart even if process is running
+                        if frame_age > 60:
+                            print(f"⚠️ Background monitor: Camera {camera_id} has stale frames ({frame_age:.1f}s old) - restarting")
+                            # Kill the frozen process
+                            if running:
+                                try:
+                                    proc.terminate()
+                                    proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                except Exception as e:
+                                    print(f"Error terminating stale process for camera {camera_id}: {e}")
+                            
+                            # Clean up stale frames
+                            cleanup_camera_frames(camera_id)
+                            
+                            # Attempt restart
+                            restart_success = restart_decode_process(camera_id, task)
+                            if restart_success:
+                                print(f"✅ Background monitor: Successfully restarted camera {camera_id} after stale frames")
+                            else:
+                                print(f"❌ Background monitor: Failed to restart camera {camera_id} after stale frames")
+                            continue  # Skip the normal stopped process check
+                except Exception as e:
+                    print(f"Error checking frame age in background monitor for camera {camera_id}: {e}")
+            
             if not running:
                 # Process stopped - get return code and log it
                 return_code = proc.poll()
@@ -271,6 +309,7 @@ async def decode_video(
     force_format: Optional[str] = Form(None)
 ):
     """Start decoding for a camera and register the process."""
+    print(f"🚀 DECODE REQUEST: Camera {camera_id}, url={url}, fps={fps}, force_format={force_format}")
     if not file and not url:
         raise HTTPException(status_code=400, detail="Either a file or a URL must be provided.")
 
@@ -311,7 +350,7 @@ async def decode_video(
 
     try:
         # Run ffmpeg decode asynchronously in a subprocess
-        print(f"Starting decode for camera {camera_id} with input: {input_path}")
+        print(f"🚀 Starting decode for camera {camera_id} with input: {input_path}")
         
         # Build ffmpeg command
         input_path_str = str(input_path)
@@ -335,6 +374,7 @@ async def decode_video(
                 "-q:v", "2",  # High quality JPEG
                 f"{output_folder}/frame_%04d.jpg"
             ]
+            print(f"🚀 RTSP stream detected, using TCP transport with reconnect options")
         else:
             ffmpeg_cmd = [
                 "ffmpeg", "-i", input_path_str,
@@ -342,8 +382,9 @@ async def decode_video(
                 "-q:v", "2",
                 f"{output_folder}/frame_%04d.jpg"
             ]
+            print(f"🚀 File-based input detected")
         
-        print(f"Running ffmpeg command: {ffmpeg_cmd}")
+        print(f"🚀 Running ffmpeg command: {' '.join(ffmpeg_cmd)}")
         proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         # Store input URL for potential restart
@@ -361,7 +402,7 @@ async def decode_video(
                 'restart_count': 0
             }
         
-        print(f"Decode started for camera {camera_id}, process PID: {proc.pid}")
+        print(f"✅ DECODE STARTED: Camera {camera_id}, process PID: {proc.pid}, input: {input_url}, fps: {fps}, output: {output_folder}")
         return {
             "message": "Decoding started", 
             "camera_id": camera_id, 
@@ -387,11 +428,12 @@ async def decode_video(
 @router.post("/decode/stop/")
 async def stop_decode(camera_id: str = Form(...)):
     """Stop decoding for a camera."""
+    print(f"🛑 STOP DECODE REQUEST: Camera {camera_id}")
     with task_lock:
         task = decode_tasks.get(camera_id)
         if not task:
             # No task exists - already stopped, just clean up frames and return success
-            print(f"No decode task found for camera {camera_id}, already stopped")
+            print(f"⚠️ No decode task found for camera {camera_id}, already stopped")
             cleanup_camera_frames(camera_id)
             return {"message": "Decoding stopped (no task was running)", "camera_id": camera_id}
         
@@ -399,22 +441,30 @@ async def stop_decode(camera_id: str = Form(...)):
         if proc is None:
             # Synchronous decode completed - just mark as stopped
             task['status'] = 'stopped'
-            print(f"Marked synchronous decode task as stopped for camera {camera_id}")
+            print(f"✅ Marked synchronous decode task as stopped for camera {camera_id}")
             # Clean up frames when stopping
             cleanup_camera_frames(camera_id)
             return {"message": "Decoding stopped", "camera_id": camera_id}
         
         # Handle subprocess-based decoding
+        print(f"🛑 Stopping decode process for camera {camera_id} (PID: {proc.pid})")
         if is_process_running(proc):
+            print(f"🛑 Process is running, terminating...")
             proc.terminate()
             try:
                 proc.wait(timeout=5)
+                print(f"✅ Process terminated successfully for camera {camera_id}")
             except subprocess.TimeoutExpired:
+                print(f"⚠️ Process did not terminate, killing...")
                 proc.kill()
+                proc.wait()
+                print(f"✅ Process killed for camera {camera_id}")
         task['status'] = 'stopped'
         
         # Clean up frames when stopping
+        print(f"🧹 Cleaning up frames for camera {camera_id}")
         cleanup_camera_frames(camera_id)
+        print(f"✅ DECODE STOPPED: Camera {camera_id} - process stopped and frames cleaned up")
         return {"message": "Decoding stopped", "camera_id": camera_id}
 
 @router.get("/decode/status/")
@@ -451,14 +501,33 @@ async def decode_status(camera_id: str):
                     frame_mtime = latest_frame_path.stat().st_mtime
                     frame_age = current_time - frame_mtime
                     
-                    # If frames are very old (>5 minutes), mark as error
-                    if frame_age > 300:
-                        task['status'] = 'error'
-                        task['last_error'] = f"Stream disconnected - no new frames for {frame_age:.1f}s"
-                        print(f"Camera {camera_id} marked as error: frames are {frame_age:.1f}s old")
+                    # If frames are very old (>1 minute), restart the decode process
+                    if frame_age > 60:
+                        print(f"⚠️ Camera {camera_id} has stale frames ({frame_age:.1f}s old) - attempting restart")
+                        # Kill the process if it's still running (it's likely frozen)
+                        if running:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                            except Exception as e:
+                                print(f"Error terminating stale process for camera {camera_id}: {e}")
+                        
                         # Clean up stale frames
                         cleanup_camera_frames(camera_id)
-                        frame_count = 0
+                        
+                        # Attempt to restart the decode process
+                        restart_success = restart_decode_process(camera_id, task)
+                        if restart_success:
+                            print(f"✅ Successfully restarted decode process for camera {camera_id} after detecting stale frames")
+                            frame_count = 0  # Reset frame count after restart
+                        else:
+                            # If restart failed, mark as error
+                            task['status'] = 'error'
+                            task['last_error'] = f"Stream disconnected - no new frames for {frame_age:.1f}s, restart failed"
+                            print(f"❌ Failed to restart decode process for camera {camera_id} after stale frames detected")
+                            frame_count = 0
             except Exception as e:
                 print(f"Error checking frame age for camera {camera_id}: {e}")
         
@@ -563,8 +632,8 @@ async def get_latest_frame(camera_id: str):
                 else:
                     task['status'] = 'stopped'
             
-            # If frame is very old (>5 minutes), clean up and mark as stopped
-            if frame_age > 300:
+            # If frame is very old (>1 minute), clean up and mark as stopped
+            if frame_age > 60:
                 print(f"Cleaning up stale frames for camera {camera_id}")
                 cleanup_camera_frames(camera_id)
                 # Update task status to reflect that streaming has stopped
