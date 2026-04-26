@@ -44,3 +44,5 @@ async def startup_event():
     print("Starting background decode process monitor...")
     asyncio.create_task(background_monitor_decode_processes())
     print("Background monitor started. Decode processes will be automatically restarted if they stop.")
+
+// Contributed via automated bounty system
