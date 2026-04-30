@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        # Note: image includes ffmpeg + intel-media-va-driver (ubuntu:24.04 base).
+        # Build takes ~5-8 min on first run; driver installs fine without /dev/dri device.
+        run: docker build -t video-pipeline-x86 .
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name video-pipeline \
+            -p 8002:8002 \
+            video-pipeline-x86
+
+      - name: Wait for service to be healthy
+        run: |
+          echo "Waiting for video pipeline service..."
+          timeout 90 bash -c \
+            'until curl -sf http://localhost:8002/api/v1/video-pipeline/health/; do sleep 3; done'
+
+      - name: Assert health endpoint returns 200
+        run: |
+          curl -sf http://localhost:8002/api/v1/video-pipeline/health/ | grep '"status"'
+
+      - name: Assert root endpoint is reachable
+        run: |
+          curl -sf http://localhost:8002/ | grep "running"
+
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs video-pipeline
